@@ -17,6 +17,11 @@ import sys
 import time
 from pathlib import Path
 
+# Required for cuBLAS-side determinism when torch.use_deterministic_algorithms
+# is enabled. Must be set before torch / cuBLAS initialises, hence before
+# `import torch`.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 import torch
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 from qwen_vl_utils import process_vision_info
@@ -25,9 +30,10 @@ from qwen_vl_utils import process_vision_info
 MODEL_DIR = os.environ.get(
     "GNR_MODEL_DIR", "./model_cache/Qwen2.5-VL-7B-Instruct"
 )
-MAX_NEW_TOKENS = 1024
+MAX_NEW_TOKENS = 768
 SKIP = 5
 LETTER_TO_INT = {"A": 1, "B": 2, "C": 3, "D": 4}
+
 
 # Qwen2.5-VL processes images dynamically at any resolution. The default
 # max_pixels (~12.8M) is huge and blows up activation memory on T4-class
@@ -41,132 +47,40 @@ MAX_PIXELS = int(os.environ.get("GNR_MAX_PIXELS", 1280 * 28 * 28))
 LOAD_IN_4BIT = os.environ.get("GNR_LOAD_IN_4BIT", "0") == "1"
 
 PROMPT = (
-    "You are an expert deep learning researcher with comprehensive knowledge "
-    "of neural network architectures, PyTorch, NumPy, optimization, "
-    "regularization, attention/transformers, and ML theory.\n\n"
-    "The image shows a multiple-choice question about deep learning with "
-    "EXACTLY four options labelled A, B, C, and D. Exactly one option is "
-    "correct.\n\n"
-    "Workflow:\n"
-    "1. Read the entire question text from the image. Pay close attention to:\n"
-    "   - Whether the question asks for the CORRECT option, the INCORRECT "
-    "option, or which statement is NOT true / is FALSE / is an EXCEPTION.\n"
-    "   - Exact numerical values (kernel size, stride, padding, dimensions, "
-    "channels, learning rate, dropout p, etc.).\n"
-    "   - The exact framework / API (PyTorch nn.Module, torch.nn.functional, "
-    "NumPy, etc.).\n"
-    "2. Read ALL FOUR options A, B, C, D carefully and verbatim from the "
-    "image. Note subtle differences between similar-looking options (e.g. "
-    "dim=0 vs dim=1, stride=1 vs stride=2, with vs without bias, "
-    "log_softmax vs softmax, batch_first=True vs False).\n"
-    "3. Reason step by step. For computational questions, write the formula "
-    "and the arithmetic explicitly. Reference values:\n"
-    "   - Conv2d output spatial size: floor((W - K + 2P) / S) + 1\n"
-    "   - MaxPool2d output spatial size: floor((W - K) / S) + 1\n"
-    "   - ConvTranspose2d output: (W - 1) * S - 2P + K\n"
-    "   - Conv2d trainable params: out_ch * (in_ch * K * K + (1 if bias else 0))\n"
-    "   - Linear params: in_features * out_features + (out_features if bias else 0)\n"
-    "   - LSTM output shape (batch_first=True): (batch, seq_len, hidden_size)\n"
-    "   - Embedding output: input_shape + (embedding_dim,)\n"
-    "   - MultiheadAttention output: same shape as query\n"
-    "4. Eliminate clearly wrong options first, then choose between the "
-    "remaining ones. Re-check your arithmetic before committing.\n"
-    "5. End your response with EXACTLY ONE final line, on its own line, "
-    "with nothing after it, in this exact format:\n\n"
-    "FINAL: X\n\n"
-    "where X is a single letter: A, B, C, or D.\n\n"
-    "Use FINAL: SKIP only as a true last resort if the image is unreadable. "
-    "Otherwise ALWAYS commit to your best answer — an educated guess has "
-    "positive expected value over skipping."
+    "You are an expert in deep learning, PyTorch, and neural networks.\n\n"
+    "The image shows a multiple-choice question with exactly four options "
+    "labelled A, B, C, and D.\n\n"
+    "Instructions:\n"
+    "1. Read the question and ALL four options carefully from the image.\n"
+    "2. Reason step by step. For shape/computation questions, show the "
+    "formula and arithmetic (e.g. CNN output size = floor((W - K + 2P)/S) + 1).\n"
+    "3. End your response with EXACTLY one final line in this format:\n"
+    "FINAL: <X>\n"
+    "where <X> is one of A, B, C, D, or SKIP.\n"
+    "Use SKIP only if you genuinely cannot decide; otherwise commit to your "
+    "best option."
 )
-
-
-# ---------------------------------------------------------------------------
-# Answer parsing — robust, last-match-wins so reasoning that mentions multiple
-# letters before settling on one is handled correctly.
-# ---------------------------------------------------------------------------
-
-# Strict canonical format we asked for in the prompt. Allows markdown
-# bolding (* or _ or `), parens, brackets, and a leading colon/dash.
-_FINAL_PATTERN = re.compile(
-    r"FINAL\s*[:\-]?\s*[\*_`]{0,2}\(?\[?\s*([A-D]|SKIP)\s*\]?\)?[\*_`]{0,2}",
-    re.IGNORECASE,
-)
-
-# Layered fallbacks — common phrasings the model might use even after being
-# told to use FINAL:. Letters are captured in group(1).
-_FALLBACK_PATTERNS = [
-    re.compile(r"\\boxed\{\s*\(?([A-D])\)?\s*\}", re.IGNORECASE),
-    re.compile(
-        r"(?:the\s+)?(?:correct\s+)?answer\s+(?:is|:)\s*"
-        r"[\*_`]{0,2}\(?\[?\s*([A-D])\s*\]?\)?",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"correct\s+(?:answer|option|choice)\s+(?:is|:)\s*"
-        r"[\*_`]{0,2}\(?\[?\s*([A-D])\s*\]?\)?",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"option\s*\(?\[?\s*([A-D])\s*\]?\)?\s+is\s+(?:the\s+)?(?:correct|right|true)",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"(?:choose|select|pick)\s+(?:option\s+)?\(?\[?\s*([A-D])\s*\]?\)?",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"(?:therefore|so|hence|thus|consequently),?\s+"
-        r"(?:the\s+)?(?:answer|correct\s+option|correct\s+choice)\s+is\s+"
-        r"[\*_`]{0,2}\(?\[?\s*([A-D])\s*\]?\)?",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\boption\s*[:\-]\s*\(?\[?\s*([A-D])\s*\]?\)?", re.IGNORECASE
-    ),
-    re.compile(
-        r"\banswer\s*[:\-]\s*[\*_`]{0,2}\(?\[?\s*([A-D])\s*\]?\)?",
-        re.IGNORECASE,
-    ),
-]
-
-
-def _last_match(text: str, patterns) -> "re.Match | None":
-    """Return the latest (rightmost-occurring) match across all patterns."""
-    best = None
-    best_pos = -1
-    for pat in patterns:
-        for m in pat.finditer(text):
-            if m.start() > best_pos:
-                best_pos = m.start()
-                best = m
-    return best
 
 
 def parse_answer(text: str) -> int:
     """Map free-form model output to {1,2,3,4,5}. Defaults to 5 on failure."""
-    if not text:
-        return SKIP
-
-    # 1. Canonical FINAL: X — last occurrence wins (in case the model emits
-    #    multiple, e.g. mentions "FINAL:" inside its reasoning).
-    final_matches = list(_FINAL_PATTERN.finditer(text))
-    if final_matches:
-        token = final_matches[-1].group(1).upper()
+    m = re.search(
+        r"FINAL\s*[:\-]\s*\*{0,2}\(?([A-D]|SKIP)\)?\*{0,2}",
+        text,
+        re.IGNORECASE,
+    )
+    if m:
+        token = m.group(1).upper()
         return LETTER_TO_INT.get(token, SKIP)
 
-    # 2. Fallback phrasings — last match across all patterns.
-    fb = _last_match(text, _FALLBACK_PATTERNS)
-    if fb:
-        return LETTER_TO_INT[fb.group(1).upper()]
-
-    # 3. Last-resort: a bare letter on its own line near the end of the
-    #    response. Only accept if it's the very last non-empty line, to
-    #    avoid picking up letters from option text mid-reasoning.
-    tail_lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
-    if tail_lines:
-        last = tail_lines[-1]
-        m = re.fullmatch(r"[\*_`\(\[]*\s*([A-D])\s*[\.\)\]\*_`]*", last)
+    fallback_patterns = [
+        r"answer\s+is\s*[:\-]?\s*\*{0,2}\(?([A-D])\)?",
+        r"correct\s+(?:answer|option|choice)\s+is\s*[:\-]?\s*\*{0,2}\(?([A-D])\)?",
+        r"option\s+\(?([A-D])\)?\s+is\s+correct",
+        r"\boption\s*[:\-]\s*\(?([A-D])\)?",
+    ]
+    for pat in fallback_patterns:
+        m = re.search(pat, text, re.IGNORECASE)
         if m:
             return LETTER_TO_INT[m.group(1).upper()]
 
@@ -206,8 +120,13 @@ def load_model():
         MODEL_DIR, **load_kwargs
     )
     model.eval()
+    # Force the slow image processor. The new "fast" Qwen2VLImageProcessor
+    # default uses a different resampling kernel and produces subtly
+    # different image tensors -- enough to flip borderline answers between
+    # transformers patch versions. Pinning use_fast=False keeps decoding
+    # reproducible across environments.
     processor = AutoProcessor.from_pretrained(
-        MODEL_DIR, min_pixels=MIN_PIXELS, max_pixels=MAX_PIXELS
+        MODEL_DIR, min_pixels=MIN_PIXELS, max_pixels=MAX_PIXELS, use_fast=False
     )
     return model, processor
 
@@ -247,7 +166,26 @@ def predict_one(model, processor, image_path: Path) -> tuple[int, str]:
     return parse_answer(response), response
 
 
+def _enable_determinism() -> None:
+    """Best-effort bit-for-bit determinism across runs on the same GPU.
+
+    Uses ``warn_only=True`` so any op without a deterministic kernel falls
+    back gracefully instead of raising -- we never want a hard crash here,
+    since on the auto-graded test system any failure scores 0.
+    """
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except Exception:
+        pass
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = False
+
+
 def main() -> int:
+    _enable_determinism()
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--test_dir", required=True, type=Path)
     parser.add_argument(
@@ -267,8 +205,22 @@ def main() -> int:
     image_names: list[str] = []
     with open(test_csv, "r", newline="") as f:
         reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        # Per TA: test.csv uses `id` as the column name (== image_name).
+        # Fall back to `image_name` for compatibility with the older sample.
+        if "id" in fieldnames:
+            key = "id"
+        elif "image_name" in fieldnames:
+            key = "image_name"
+        else:
+            print(
+                f"[infer] ERROR: {test_csv} must have an 'id' or 'image_name' column "
+                f"(found {fieldnames})",
+                file=sys.stderr,
+            )
+            return 1
         for row in reader:
-            image_names.append(row["image_name"].strip())
+            image_names.append(row[key].strip())
     print(f"[infer] {len(image_names)} test rows from {test_csv}", flush=True)
 
     model, processor = load_model()
@@ -277,12 +229,13 @@ def main() -> int:
     t0 = time.time()
     with open(submission_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["image_name", "option"])
+        # Per TA: submission must be `id, image_name, option` with id == image_name.
+        writer.writerow(["id", "image_name", "option"])
         for i, name in enumerate(image_names, 1):
             img_path = image_dir / f"{name}.png"
             if not img_path.is_file():
                 print(f"[infer] [{i}/{len(image_names)}] {name}: image missing -> SKIP", flush=True)
-                writer.writerow([name, SKIP])
+                writer.writerow([name, name, SKIP])
                 f.flush()
                 continue
             try:
@@ -297,7 +250,7 @@ def main() -> int:
             finally:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-            writer.writerow([name, ans])
+            writer.writerow([name, name, ans])
             f.flush()
 
     print(f"[infer] Wrote {submission_path} ({time.time() - t0:.1f}s total)", flush=True)
