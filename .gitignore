@@ -1,0 +1,10 @@
+# Ignore everything by default
+*
+
+# Whitelist only the files that should land in the repo
+!.gitignore
+!inference.py
+!environment.yml
+!requirements.txt
+!README.md
+!GNR_Project_Report.pdf
