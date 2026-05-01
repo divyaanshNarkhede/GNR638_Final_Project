@@ -267,8 +267,21 @@ def main() -> int:
     image_names: list[str] = []
     with open(test_csv, "r", newline="") as f:
         reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        if "id" in fieldnames:
+            key = "id"
+        elif "image_name" in fieldnames:
+            key = "image_name"
+        else:
+            print(
+                f"[infer] ERROR: {test_csv} must have an 'id' or 'image_name' column "
+                f"(found {fieldnames})",
+                file=sys.stderr,
+            )
+            return 1
         for row in reader:
-            image_names.append(row["image_name"].strip())
+            image_names.append(row[key].strip())
+            
     print(f"[infer] {len(image_names)} test rows from {test_csv}", flush=True)
 
     model, processor = load_model()
@@ -277,12 +290,12 @@ def main() -> int:
     t0 = time.time()
     with open(submission_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["image_name", "option"])
+        writer.writerow(["id", "image_name", "option"])
         for i, name in enumerate(image_names, 1):
             img_path = image_dir / f"{name}.png"
             if not img_path.is_file():
                 print(f"[infer] [{i}/{len(image_names)}] {name}: image missing -> SKIP", flush=True)
-                writer.writerow([name, SKIP])
+                writer.writerow([name, name, SKIP])
                 f.flush()
                 continue
             try:
@@ -297,7 +310,7 @@ def main() -> int:
             finally:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-            writer.writerow([name, ans])
+            writer.writerow([name, name, ans])
             f.flush()
 
     print(f"[infer] Wrote {submission_path} ({time.time() - t0:.1f}s total)", flush=True)
