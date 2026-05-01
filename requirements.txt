@@ -1,0 +1,9 @@
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.6.0
+torchvision==0.21.0
+transformers>=4.49.0,<4.55
+accelerate>=1.3.0
+qwen-vl-utils[decord]==0.0.8
+pillow>=10.0.0
+huggingface_hub>=0.27.0
+bitsandbytes>=0.45.0
